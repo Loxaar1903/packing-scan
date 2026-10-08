@@ -119,6 +119,7 @@ input[type=text]{font:inherit;width:100%;min-height:44px;padding:0 12px;border-r
 <div id="toast" class="toast" hidden></div>
 <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
 
+<script src="https://cdn.jsdelivr.net/npm/barcode-detector@3.1.3/dist/iife/ponyfill.js"></script>
 <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.6/JsBarcode.all.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
@@ -174,7 +175,7 @@ function homeHTML(){
       <span class="meta">${fmtDate(p.created)}${p.ref?' · '+esc(p.ref):''}</span>
     </button>`).join('')}</div>`
     :`<div class="empty">Aucune palette. Crée-en une pour commencer à scanner les rouleaux.</div>`;
-  return `<div class="topbar"><div><h1>Packing Scan</h1><div class="sub">${state.pallets.length} palette${state.pallets.length>1?'s':''} sur ce téléphone</div></div></div>
+  return `<div class="topbar"><div><h1>Packing Scan</h1><div class="sub">${state.pallets.length} palette${state.pallets.length>1?'s':''} sur ce téléphone · v2</div></div></div>
   ${list}
   <div class="dock"><div class="inner"><button class="btn primary" data-act="new">${ICON.plus} Nouvelle palette</button></div></div>`;
 }
@@ -314,24 +315,69 @@ function openScanner(){
   </div>`;
   startCamera();
 }
-async function startCamera(){
-  const showFallback=()=>{const vf=$('#vf');if(vf)vf.hidden=true;const fb=$('#fallback');if(fb)fb.hidden=false;};
-  if(typeof ZXing==='undefined'){showFallback();return;}
-  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){showFallback();return;}
-  try{
-    reader=new ZXing.BrowserMultiFormatReader(hints(),250);
-    scanning=true;
-    await reader.decodeFromConstraints({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}},'video',(res)=>{
-      if(!res||!scanning) return;
-      const code=res.getText(), now=Date.now();
-      if(code===lastCode&&now-lastAt<2500) return;
-      lastCode=code;lastAt=now;addCode(code);
-    });
-    const m=$('#vfmsg');if(m)m.hidden=true;
-    try{if(navigator.wakeLock)navigator.wakeLock.request('screen').catch(()=>{});}catch(e){}
-  }catch(e){stopCamera();showFallback();}
+let stream=null, detector=null, loopT=null;
+function vfMsg(t){const m=$('#vfmsg');if(!m)return;m.hidden=!t;m.textContent=t||'';}
+function camErrorText(e){
+  const n=e&&e.name||'';
+  if(n==='NotAllowedError'||n==='SecurityError') return "Accès à la caméra refusé. Sur iPhone : Réglages › Safari › Caméra › Autoriser, puis recharge la page.";
+  if(n==='NotFoundError'||n==='OverconstrainedError') return "Aucune caméra arrière trouvée.";
+  if(n==='NotReadableError') return "La caméra est utilisée par une autre appli. Ferme-la et réessaie.";
+  return "La caméra n'a pas démarré ("+(n||e&&e.message||'erreur inconnue')+").";
 }
-function stopCamera(){scanning=false;try{reader&&reader.reset();}catch(e){}reader=null;}
+function makeDetector(){
+  const fmts=['qr_code','code_128','data_matrix','code_39','ean_13','itf'];
+  try{ if(window.BarcodeDetectionAPI&&BarcodeDetectionAPI.BarcodeDetector) return new BarcodeDetectionAPI.BarcodeDetector({formats:fmts}); }catch(e){}
+  try{ if('BarcodeDetector' in window) return new window.BarcodeDetector({formats:fmts}); }catch(e){}
+  return null;
+}
+async function startCamera(){
+  const showFallback=(msg)=>{const vf=$('#vf');if(vf)vf.hidden=true;const fb=$('#fallback');if(fb){fb.hidden=false;if(msg)fb.querySelector('p').textContent=msg;}};
+  if(!window.isSecureContext||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){showFallback();return;}
+  const video=$('#video');
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}});
+  }catch(e){
+    if(inArtifact()){showFallback();return;}
+    vfMsg(camErrorText(e));return;
+  }
+  if(!video){stopCamera();return;}
+  video.setAttribute('playsinline','');video.muted=true;video.srcObject=stream;
+  try{await video.play();}catch(e){}
+  scanning=true;
+  try{if(navigator.wakeLock)navigator.wakeLock.request('screen').catch(()=>{});}catch(e){}
+  detector=makeDetector();
+  if(detector){vfMsg('');detectLoop(video);return;}
+  // Fallback engine: ZXing reading the same video stream
+  if(typeof ZXing!=='undefined'){
+    vfMsg('');
+    try{
+      reader=new ZXing.BrowserMultiFormatReader(hints(),200);
+      reader.decodeFromVideoElementContinuously(video,(res)=>{if(res&&scanning)onDetected(res.getText());});
+      return;
+    }catch(e){}
+  }
+  vfMsg("Le lecteur de codes n'a pas pu se charger. Vérifie ta connexion internet et recharge la page.");
+}
+async function detectLoop(video){
+  if(!scanning) return;
+  try{
+    if(video.readyState>=2){
+      const res=await detector.detect(video);
+      if(res&&res.length) onDetected(res[0].rawValue);
+    }
+  }catch(e){}
+  loopT=setTimeout(()=>detectLoop(video),120);
+}
+function onDetected(code){
+  const now=Date.now();
+  if(!code||(code===lastCode&&now-lastAt<2500)) return;
+  lastCode=code;lastAt=now;addCode(code);
+}
+function stopCamera(){
+  scanning=false;clearTimeout(loopT);
+  try{reader&&reader.reset();}catch(e){}reader=null;
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+}
 function closeScanner(){stopCamera();const ov=$('#overlay');ov.hidden=true;ov.innerHTML='';lastCode='';render();}
 async function decodePhoto(file){
   if(typeof ZXing==='undefined'){toast('Lecteur de codes non chargé');return;}
